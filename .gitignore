@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets and local state
+.env
+config.local.yaml
+cookies.txt
+
+# Harvested output
+data/
+logs/
+*.jsonl

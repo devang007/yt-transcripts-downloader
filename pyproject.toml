@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt-tx"
+version = "1.0.0"
+description = "YouTube transcript harvester: enumerate channels, persist to MySQL, download transcripts, resume forever."
+requires-python = ">=3.11"
+
+# Every dependency is pinned exactly. YouTube-facing libraries break often, and
+# youtube-transcript-api changed its whole public API at v1.0 (static methods ->
+# instance .fetch()/.list()). The error classifier in classify.py is written
+# against the exception classes of the exact version pinned here; bumping it
+# means re-running tests/test_classify.py, which asserts on real instances.
+dependencies = [
+    "SQLAlchemy==2.0.36",
+    "PyMySQL==1.1.1",
+    # Required, not optional: MySQL 8 defaults to caching_sha2_password, and
+    # PyMySQL cannot complete that handshake without cryptography. Omitting it
+    # fails at connect time with "'cryptography' package is required".
+    "cryptography==44.0.0",
+    "alembic==1.14.0",
+    "youtube-transcript-api==1.2.4",
+    # yt-dlp is the one pin worth reviewing on a schedule. YouTube changes its
+    # channel-page markup often, and an old yt-dlp does not error - it returns
+    # *zero entries* and enumeration silently finds nothing. 2024.12.13 could no
+    # longer parse the /videos tab ("Unsupported lockup view model content
+    # type"). If discovery starts reporting empty tabs, bump this first.
+    "yt-dlp==2026.7.4",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "typer==0.15.1",
+    # Pinned below 8.2: click 8.2 changed Parameter.make_metavar() to require a
+    # ctx argument, and typer 0.15.1 calls it with none. Any --help renders a
+    # TypeError traceback instead of help text. Unpin only together with typer.
+    "click==8.1.8",
+    "structlog==24.4.0",
+    "PyYAML==6.0.2",
+    "requests==2.32.3",
+    "python-dotenv==1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "mypy==1.14.0",
+    "httpx==0.28.1",
+    "types-requests==2.32.0.20241016",
+    "types-PyYAML==6.0.12.20240917",
+    "freezegun==1.5.1",
+]
+
+[project.scripts]
+yt-tx = "yt_tx.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+yt_tx = ["static/*.html", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests are excluded by default and opted into with
+# `pytest -m integration`. They hit YouTube, so they are slow, they spend the
+# same IP reputation the harvester depends on, and they fail for reasons
+# unrelated to this code.
+addopts = "-m 'not integration'"
+markers = [
+    "mysql: needs a real MySQL 8 server (set YT_TX_TEST_DSN)",
+    "integration: hits the live network; opt in with -m integration",
+]
+filterwarnings = ["error::DeprecationWarning:yt_tx.*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["yt_tx"]
+warn_unreachable = true
+
+# yt_dlp ships no usable type information.
+[[tool.mypy.overrides]]
+module = ["yt_dlp.*"]
+ignore_missing_imports = true

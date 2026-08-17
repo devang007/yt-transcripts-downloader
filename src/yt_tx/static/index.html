@@ -1,0 +1,897 @@
+<!doctype html>
+<!--
+  yt-tx control panel. One file, no build step, two CDN dependencies.
+
+  This is an internal control panel, not a product, so it is deliberately plain:
+  Alpine for reactivity, Tailwind for layout, and no bundler to keep working.
+
+  Three things here are load-bearing rather than cosmetic:
+
+  1. Every knob is labelled with its tier. A rate-limit slider that silently does
+     nothing until the next restart is worse than no slider, so LIVE / NEXT RUN /
+     SECRET is shown on each control and the live ones say so explicitly.
+  2. The log console keeps a hard 2,000-line ring buffer in the DOM. An unbounded
+     console will lock up the tab on a 50k-video run.
+  3. ETA is a range, and is hidden while paused or circuit-open, where a trailing
+     completion rate tells you nothing about how long the rest will take.
+-->
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>yt-tx control panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { background:#0b0f14; color:#dbe4ee; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .card { background:#111823; border:1px solid #1e2a3a; border-radius:.5rem; }
+    .btn { border-radius:.375rem; padding:.35rem .75rem; font-size:.8125rem; font-weight:600;
+           border:1px solid #2a3a4f; background:#182231; color:#dbe4ee; }
+    .btn:hover:not(:disabled) { background:#1f2c3e; }
+    .btn:disabled { opacity:.4; cursor:not-allowed; }
+    .btn-go { background:#14532d; border-color:#166534; color:#d7f5e0; }
+    .btn-go:hover:not(:disabled) { background:#166534; }
+    .btn-warn { background:#5a3d0b; border-color:#7c4f0a; color:#ffe9c2; }
+    .btn-stop { background:#5c1a1a; border-color:#7f2323; color:#ffd9d9; }
+    input, select { background:#0d141d; border:1px solid #253347; border-radius:.375rem;
+                    padding:.3rem .5rem; font-size:.8125rem; color:#dbe4ee; width:100%; }
+    input:focus, select:focus { outline:1px solid #3b82f6; }
+    input[type=checkbox] { width:auto; }
+    table { border-collapse:collapse; width:100%; }
+    th { text-align:left; font-size:.6875rem; letter-spacing:.06em; text-transform:uppercase;
+         color:#7d8ea4; padding:.4rem .5rem; border-bottom:1px solid #1e2a3a; position:sticky; top:0;
+         background:#111823; }
+    td { padding:.35rem .5rem; border-bottom:1px solid #161f2c; font-size:.8125rem; }
+    tr.click:hover { background:#16202e; cursor:pointer; }
+    .tier { font-size:.625rem; padding:.05rem .3rem; border-radius:.25rem; font-weight:700;
+            letter-spacing:.04em; white-space:nowrap; }
+    .tier-live { background:#0b3b2e; color:#6ee7b7; border:1px solid #14664f; }
+    .tier-next { background:#2a2410; color:#fcd34d; border:1px solid #55471a; }
+    .tier-secret { background:#3a1220; color:#fda4af; border:1px solid #6b1f34; }
+    .pill { font-size:.6875rem; padding:.1rem .4rem; border-radius:.25rem; white-space:nowrap; }
+    .log { font-size:.75rem; line-height:1.45; }
+    .log-warning { color:#fcd34d; } .log-error, .log-critical { color:#fca5a5; }
+    .log-debug { color:#6b7f96; } .log-info { color:#cbd5e1; }
+    .scroll { overflow:auto; scrollbar-width:thin; scrollbar-color:#2a3a4f transparent; }
+    .scroll::-webkit-scrollbar { width:9px; height:9px; }
+    .scroll::-webkit-scrollbar-thumb { background:#2a3a4f; border-radius:6px; }
+    .seg { display:flex; height:100%; }
+    [x-cloak] { display:none !important; }
+  </style>
+</head>
+<body x-data="app()" x-init="boot()" x-cloak class="min-h-screen flex flex-col">
+
+<!-- ── header ───────────────────────────────────────────────────────────── -->
+<header class="sticky top-0 z-30 border-b border-[#1e2a3a] bg-[#0d131b]/95 backdrop-blur">
+  <div class="px-4 py-2 flex flex-wrap items-center gap-x-5 gap-y-2">
+    <div class="flex items-center gap-2">
+      <span class="text-lg" :class="stateColor()" x-text="stateDot()"></span>
+      <span class="font-bold tracking-wide text-sm" x-text="(stats.state||'idle').toUpperCase()"></span>
+    </div>
+
+    <div class="mono text-sm">
+      <span class="font-semibold" x-text="fmt(done())"></span>
+      <span class="text-[#7d8ea4]">/</span>
+      <span x-text="fmt(stats.total||0)"></span>
+      <span class="text-[#7d8ea4] ml-1" x-text="'(' + (stats.coverage_pct||0) + '%)'"></span>
+    </div>
+
+    <div class="mono text-sm text-[#9fb0c4]">
+      <span x-text="(stats.videos_per_minute||0)"></span> vid/min
+    </div>
+
+    <!-- Hidden while paused or circuit-open: a trailing rate says nothing
+         about the remaining work when nothing is moving. -->
+    <template x-if="stats.eta_seconds && stats.state === 'running'">
+      <div class="mono text-sm text-[#9fb0c4]">
+        ETA <span x-text="etaText()"></span>
+      </div>
+    </template>
+
+    <div class="flex-1"></div>
+
+    <div class="flex items-center gap-2">
+      <select x-model="startForm.command" class="!w-auto text-xs">
+        <option value="run">run (discover+fetch)</option>
+        <option value="discover">discover</option>
+        <option value="hydrate">hydrate</option>
+        <option value="fetch">fetch</option>
+      </select>
+      <label class="flex items-center gap-1 text-xs text-[#9fb0c4]">
+        <input type="checkbox" x-model="startForm.incremental"> incremental
+      </label>
+      <label class="flex items-center gap-1 text-xs text-[#9fb0c4]"
+             title="Off by default: transcripts are fetched straight from discovered videos, so they start landing immediately. Tick to run the metadata pass first, which fills duration and view counts and applies the shorts/streams/duration skip rules - one request per video without an API key."
+             x-show="startForm.command === 'run' || startForm.command === 'fetch'">
+        <input type="checkbox" x-model="startForm.hydrate"> hydrate metadata
+      </label>
+      <button class="btn btn-go" @click="startRun()" :disabled="busy || stats.run_alive">Start</button>
+      <button class="btn btn-warn" @click="pauseResume()"
+              :disabled="busy || !stats.run_alive"
+              x-text="stats.desired_state === 'paused' ? 'Resume' : 'Pause'"></button>
+      <button class="btn btn-stop" @click="stopRun()" :disabled="busy || !stats.run_alive">Stop</button>
+    </div>
+
+    <div class="flex items-center gap-3 text-xs">
+      <span class="pill"
+            :class="breakerClass()"
+            x-text="'circuit: ' + breakerLabel()"></span>
+      <span class="pill"
+            :class="quotaPct() >= (stats.quota?.stop_at_pct||90) ? 'bg-[#5c1a1a] text-[#ffd9d9]' : 'bg-[#182231] text-[#9fb0c4]'"
+            x-text="'quota: ' + quotaPct() + '%'"
+            :title="'Data API units ' + (stats.quota?.used||0) + ' / ' + (stats.quota?.budget||0) + ' on ' + (stats.quota?.day||'')"></span>
+    </div>
+  </div>
+
+  <!-- stopping banner: the escalation ladder, stated rather than implied -->
+  <template x-if="stats.desired_state === 'stopping' && stats.run_alive">
+    <div class="px-4 py-1 bg-[#5a3d0b] text-[#ffe9c2] text-xs">
+      Stop requested — the worker is draining in-flight work and committing.
+      SIGTERM after 60s, SIGKILL after 90s.
+      <span x-show="stopElapsed !== null" class="mono ml-1"
+            x-text="'(' + stopElapsed + 's elapsed' + (lastEscalation ? ', ' + lastEscalation : '') + ')'"></span>
+    </div>
+  </template>
+  <template x-if="alert">
+    <div class="px-4 py-1 bg-[#5c1a1a] text-[#ffd9d9] text-xs flex justify-between">
+      <span x-text="alert"></span>
+      <button @click="alert=''" class="underline">dismiss</button>
+    </div>
+  </template>
+</header>
+
+<div class="flex-1 flex min-h-0">
+
+  <!-- ── knobs ──────────────────────────────────────────────────────────── -->
+  <aside class="w-80 shrink-0 border-r border-[#1e2a3a] scroll" style="max-height:calc(100vh - 46px)">
+    <div class="p-3">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-xs font-bold uppercase tracking-wider text-[#7d8ea4]">Knobs</h2>
+        <button class="btn text-xs" @click="saveSettings()" :disabled="busy || !dirtyCount()">
+          Save <span x-show="dirtyCount()" x-text="'(' + dirtyCount() + ')'"></span>
+        </button>
+      </div>
+
+      <div class="text-[.6875rem] leading-relaxed text-[#7d8ea4] mb-3 space-y-.5">
+        <div><span class="tier tier-live">LIVE</span> applied to a running worker within 2s</div>
+        <div><span class="tier tier-next">NEXT RUN</span> stored now, used when the next run starts</div>
+        <div><span class="tier tier-secret">SECRET</span> write-only; never returned in full</div>
+      </div>
+
+      <template x-for="group in knobGroups()" :key="group">
+        <div class="mb-3">
+          <div class="text-[.6875rem] font-bold uppercase tracking-wider text-[#6c7f95]
+                      mb-1 border-b border-[#1a2431] pb-1" x-text="group"></div>
+          <template x-for="knob in knobsIn(group)" :key="knob.key">
+            <div class="mb-2.5">
+              <label class="flex items-start justify-between gap-2 mb-1">
+                <span class="text-xs text-[#c3d0de]" x-text="knob.label"></span>
+                <span class="tier" :class="tierClass(knob.tier)" x-text="tierLabel(knob.tier)"></span>
+              </label>
+
+              <template x-if="knob.kind === 'bool'">
+                <label class="flex items-center gap-2 text-xs text-[#9fb0c4]">
+                  <input type="checkbox" x-model="values[knob.key]" @change="touch(knob.key)">
+                  <span x-text="values[knob.key] ? 'on' : 'off'"></span>
+                </label>
+              </template>
+              <template x-if="knob.choices">
+                <select x-model="values[knob.key]" @change="touch(knob.key)">
+                  <template x-for="choice in knob.choices" :key="choice">
+                    <option :value="choice" x-text="choice"></option>
+                  </template>
+                </select>
+              </template>
+              <template x-if="!knob.choices && (knob.kind === 'int' || knob.kind === 'float')">
+                <div class="flex items-center gap-2">
+                  <input type="number" :step="knob.kind === 'float' ? 0.01 : 1"
+                         :min="knob.minimum" :max="knob.maximum"
+                         x-model.number="values[knob.key]" @input="touch(knob.key)">
+                  <input x-show="knob.minimum !== null && knob.maximum !== null"
+                         type="range" class="!w-24"
+                         :step="knob.kind === 'float' ? 0.01 : 1"
+                         :min="knob.minimum" :max="knob.maximum"
+                         x-model.number="values[knob.key]" @input="touch(knob.key)">
+                </div>
+              </template>
+              <template x-if="!knob.choices && (knob.kind === 'str_list' || knob.kind === 'int_list')">
+                <input type="text" :value="joinList(values[knob.key])"
+                       @input="values[knob.key] = $event.target.value; touch(knob.key)"
+                       placeholder="comma separated">
+              </template>
+              <template x-if="!knob.choices && knob.kind === 'str'">
+                <input :type="knob.tier === 'secret' ? 'password' : 'text'"
+                       x-model="values[knob.key]" @input="touch(knob.key)"
+                       :placeholder="knob.nullable ? '(unset)' : ''">
+              </template>
+
+              <p class="text-[.6875rem] text-[#6c7f95] mt-1 leading-snug" x-text="knob.help"></p>
+              <p x-show="dirty[knob.key]" class="text-[.6875rem] text-[#fcd34d] mt-.5"
+                 x-text="knob.tier === 'live' ? 'unsaved — takes effect within 2s of saving'
+                                              : 'unsaved — applies to the next run'"></p>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <div class="mt-4 pt-3 border-t border-[#1a2431]">
+        <div class="text-[.6875rem] font-bold uppercase tracking-wider text-[#6c7f95] mb-1">Add channels</div>
+        <textarea x-model="channelInput" rows="3" placeholder="@handle, UC…, or URL — one per line"
+                  class="w-full bg-[#0d141d] border border-[#253347] rounded p-2 text-xs mono"></textarea>
+        <button class="btn text-xs mt-1 w-full" @click="addChannels()" :disabled="busy || !channelInput.trim()">
+          Resolve &amp; add
+        </button>
+      </div>
+
+      <div class="mt-3 text-[.6875rem] text-[#6c7f95] mono leading-relaxed">
+        <div x-text="'transcripts: ' + (bootstrap.transcript_dir||'')"></div>
+        <div x-text="'logs: ' + (bootstrap.log_dir||'')"></div>
+        <div class="truncate" :title="bootstrap.mysql" x-text="bootstrap.mysql||''"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── centre ─────────────────────────────────────────────────────────── -->
+  <main class="flex-1 min-w-0 flex flex-col" style="max-height:calc(100vh - 46px)">
+
+    <!-- status bar -->
+    <div class="px-4 pt-3 pb-2">
+      <div class="seg h-4 rounded overflow-hidden bg-[#0d141d] border border-[#1e2a3a]">
+        <template x-for="s in statusOrder" :key="s">
+          <div :style="'width:' + pctOf(s) + '%; background:' + statusColor(s)"
+               :title="s + ': ' + fmt(stats.by_status?.[s]||0) + ' (' + pctOf(s).toFixed(1) + '%)'"></div>
+        </template>
+      </div>
+      <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-[.6875rem]">
+        <template x-for="s in statusOrder" :key="s">
+          <button x-show="(stats.by_status?.[s]||0) > 0" @click="filterStatus(s)"
+                  class="flex items-center gap-1 hover:underline">
+            <span class="inline-block w-2 h-2 rounded-sm" :style="'background:'+statusColor(s)"></span>
+            <span class="text-[#9fb0c4]" x-text="s"></span>
+            <span class="mono text-[#6c7f95]" x-text="fmt(stats.by_status?.[s]||0)"></span>
+          </button>
+        </template>
+        <span class="text-[#6c7f95]" x-text="'needs_audio ' + fmt(stats.needs_audio||0)"></span>
+        <span class="text-[#6c7f95]" x-text="'transcripts ' + fmt(stats.transcripts||0)"></span>
+        <a class="btn text-[.6875rem] no-underline self-center"
+           :href="exportUrl('txt')"
+           :class="{ 'pointer-events-none opacity-40': !(stats.transcripts > 0) }"
+           :title="'Every stored transcript in one plain-text file, one after another. '
+                   + (drill ? 'This channel only.' : 'All channels.')
+                   + ' Streamed, so a large corpus starts downloading immediately.'"
+           x-text="drill
+             ? 'download ' + (drill.handle || drill.channel_id) + ' transcripts (.txt)'
+             : 'download all transcripts (.txt)'"></a>
+      </div>
+    </div>
+
+    <!-- channel table / video table -->
+    <div class="flex-1 min-h-0 scroll px-4">
+      <!-- channels -->
+      <div x-show="!drill">
+        <table>
+          <thead><tr>
+            <th>Channel</th><th class="text-right">Total</th><th class="text-right">Done</th>
+            <th class="text-right">No-TX</th><th class="text-right">Fail</th>
+            <th class="text-right">Cover</th><th>Enum</th><th></th>
+          </tr></thead>
+          <tbody>
+            <template x-for="c in channels" :key="c.channel_id">
+              <tr class="click" @click="openChannel(c)">
+                <td>
+                  <span class="mono" x-text="c.handle || c.channel_id"></span>
+                  <span class="text-[#6c7f95] ml-1" x-text="c.title || ''"></span>
+                  <span x-show="!c.is_enabled" class="pill bg-[#2a2410] text-[#fcd34d] ml-1">disabled</span>
+                </td>
+                <td class="text-right mono" x-text="fmt(c.total)"></td>
+                <td class="text-right mono text-[#6ee7b7]" x-text="fmt(c.done)"></td>
+                <td class="text-right mono text-[#fcd34d]" x-text="fmt(c.no_transcript)"></td>
+                <td class="text-right mono" :class="c.failed ? 'text-[#fca5a5]' : 'text-[#6c7f95]'"
+                    x-text="fmt(c.failed)"></td>
+                <td class="text-right mono" x-text="c.coverage_pct + '%'"></td>
+                <td class="text-[.6875rem]"
+                    :class="c.enumeration_complete ? 'text-[#6c7f95]' : 'text-[#fcd34d]'"
+                    x-text="c.enumeration_complete ? 'complete' : 'partial'"></td>
+                <td class="text-right whitespace-nowrap" @click.stop>
+                  <button class="btn text-[.6875rem]" @click="toggleChannel(c)"
+                          x-text="c.is_enabled ? 'disable' : 'enable'"></button>
+                  <button class="btn text-[.6875rem]" @click="removeChannel(c)">remove</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!channels.length">
+              <td colspan="8" class="text-center text-[#6c7f95] py-6">
+                No channels yet. Add one in the panel on the left.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- videos -->
+      <div x-show="drill">
+        <div class="flex flex-wrap items-center gap-2 mb-2">
+          <button class="btn text-xs" @click="closeChannel()">&larr; channels</button>
+          <span class="mono text-sm" x-text="drill?.handle || drill?.channel_id || ''"></span>
+          <select x-model="videoFilter.status" @change="loadVideos(1)" class="!w-auto text-xs">
+            <option value="">all statuses</option>
+            <template x-for="s in statusOrder" :key="s"><option :value="s" x-text="s"></option></template>
+          </select>
+          <select x-model="videoFilter.sort" @change="loadVideos(1)" class="!w-auto text-xs">
+            <option value="published_desc">newest first</option>
+            <option value="published_asc">oldest first</option>
+            <option value="duration_desc">longest</option>
+            <option value="duration_asc">shortest</option>
+            <option value="views_desc">most viewed</option>
+            <option value="title_asc">title A–Z</option>
+          </select>
+          <input type="text" x-model="videoFilter.q" @keydown.enter="loadVideos(1)"
+                 placeholder="search title or paste a video id" class="!w-64 text-xs">
+          <span class="text-xs text-[#6c7f95] mono"
+                x-text="fmt(videoTotal) + ' videos · page ' + videoPage + '/' + videoPages"></span>
+          <button class="btn text-xs" @click="loadVideos(videoPage-1)" :disabled="videoPage<=1">prev</button>
+          <button class="btn text-xs" @click="loadVideos(videoPage+1)" :disabled="videoPage>=videoPages">next</button>
+        </div>
+        <table>
+          <thead><tr>
+            <th>Video</th><th>Status</th><th class="text-right">Dur</th>
+            <th class="text-right">Views</th><th>Published</th><th class="text-right">Try</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="v in videos" :key="v.video_id">
+              <tr class="click" @click="openVideo(v)">
+                <td>
+                  <div class="truncate max-w-xl" x-text="v.title || v.video_id"></div>
+                  <div class="mono text-[.6875rem] text-[#6c7f95]">
+                    <span x-text="v.video_id"></span>
+                    <span x-show="v.is_short" class="ml-1">· short</span>
+                    <span x-show="v.was_livestream" class="ml-1">· stream</span>
+                    <span x-show="v.needs_audio" class="ml-1 text-[#fcd34d]">· needs audio</span>
+                  </div>
+                </td>
+                <td>
+                  <span class="pill" :style="'background:'+statusColor(v.status)+'22; color:'+statusColor(v.status)"
+                        :title="v.status_reason || ''" x-text="v.status"></span>
+                </td>
+                <td class="text-right mono text-[#9fb0c4]" x-text="dur(v.duration_seconds)"></td>
+                <td class="text-right mono text-[#9fb0c4]" x-text="fmt(v.view_count)"></td>
+                <td class="mono text-[.6875rem] text-[#6c7f95]" x-text="(v.published_at||'').slice(0,10)"></td>
+                <td class="text-right mono text-[#6c7f95]" x-text="v.attempts"></td>
+              </tr>
+            </template>
+            <tr x-show="!videos.length">
+              <td colspan="6" class="text-center text-[#6c7f95] py-6">No videos match.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── log console ──────────────────────────────────────────────────── -->
+    <section class="border-t border-[#1e2a3a] shrink-0" :style="'height:' + logHeight + 'px'">
+      <div class="flex items-center gap-2 px-4 py-1 border-b border-[#161f2c] bg-[#0d131b]">
+        <span class="text-xs font-bold uppercase tracking-wider text-[#7d8ea4]">Live log</span>
+        <template x-for="lvl in ['all','info','warning','error']" :key="lvl">
+          <button class="btn !py-.5 !px-2 text-[.6875rem]"
+                  :class="logLevel===lvl ? 'bg-[#1f3348] border-[#3b82f6]' : ''"
+                  @click="logLevel=lvl" x-text="lvl"></button>
+        </template>
+        <input type="text" x-model="logSearch" placeholder="filter…" class="!w-48 text-xs">
+        <label class="flex items-center gap-1 text-xs text-[#9fb0c4]">
+          <input type="checkbox" x-model="autoscroll"> autoscroll
+        </label>
+        <span class="text-[.6875rem] text-[#6c7f95] mono"
+              x-text="visibleLogs().length + '/' + logs.length + ' lines'"></span>
+        <span class="text-[.6875rem] mono"
+              :class="sseState==='open' ? 'text-[#6ee7b7]' : sseState==='connecting' ? 'text-[#fcd34d]' : 'text-[#6c7f95]'"
+              x-text="'sse: ' + sseState + (followRun ? ' (run ' + followRun + ')' : '')"></span>
+        <div class="flex-1"></div>
+        <select class="!w-auto text-xs" x-model.number="followRun" @change="attachStream(followRun)">
+          <option :value="0">— pick a run —</option>
+          <template x-for="r in runs" :key="r.id">
+            <option :value="r.id"
+                    x-text="'run ' + r.id + ' · ' + r.command + ' · ' + (r.exit_reason || 'active')"></option>
+          </template>
+        </select>
+        <button class="btn text-[.6875rem]" @click="logs=[]">clear</button>
+        <button class="btn text-[.6875rem]" @click="logHeight = logHeight > 200 ? 160 : 380">
+          <span x-text="logHeight > 200 ? '▾' : '▴'"></span>
+        </button>
+      </div>
+      <div class="scroll mono log px-4 py-1" x-ref="logbox"
+           :style="'height:' + (logHeight - 30) + 'px'">
+        <template x-for="line in visibleLogs()" :key="line.seq">
+          <div :class="'log-' + (line.level||'info')">
+            <span class="text-[#5c6f86]" x-text="clock(line.ts)"></span>
+            <span class="uppercase text-[.625rem] inline-block w-9" x-text="(line.level||'info').slice(0,4)"></span>
+            <span x-text="line.event"></span>
+            <span class="text-[#6c7f95]" x-text="extras(line)"></span>
+          </div>
+        </template>
+        <div x-show="!logs.length" class="text-[#6c7f95] py-3">
+          No log lines yet. Start a run, or pick an earlier run above to replay its log.
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ── video drawer ───────────────────────────────────────────────────── -->
+  <aside x-show="detail" x-cloak
+         class="w-[34rem] shrink-0 border-l border-[#1e2a3a] scroll bg-[#0d131b]"
+         style="max-height:calc(100vh - 46px)">
+    <template x-if="detail">
+      <div class="p-4">
+        <div class="flex items-start justify-between gap-2 mb-2">
+          <h3 class="text-sm font-semibold leading-snug" x-text="detail.video.title || detail.video.video_id"></h3>
+          <button class="btn text-xs" @click="detail=null">close</button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+          <a :href="'https://www.youtube.com/watch?v=' + detail.video.video_id" target="_blank"
+             rel="noopener" class="mono text-[#7dd3fc] hover:underline" x-text="detail.video.video_id"></a>
+          <span class="pill" :style="'background:'+statusColor(detail.video.status)+'22; color:'+statusColor(detail.video.status)"
+                x-text="detail.video.status"></span>
+          <span class="text-[#6c7f95] mono" x-text="dur(detail.video.duration_seconds)"></span>
+          <span class="text-[#6c7f95] mono" x-text="(detail.video.published_at||'').slice(0,10)"></span>
+          <button class="btn text-[.6875rem]" @click="refetch(detail.video.video_id)">force re-fetch</button>
+        </div>
+
+        <p x-show="detail.video.status_reason" class="text-xs text-[#fcd34d] mb-2"
+           x-text="detail.video.status_reason"></p>
+
+        <!-- available vs stored: the distinction that makes lang_missing legible -->
+        <div class="card p-2 mb-3 text-xs">
+          <div class="text-[.6875rem] uppercase tracking-wider text-[#7d8ea4] mb-1">Captions available on YouTube</div>
+          <div x-show="!detail.video.available_transcripts?.length" class="text-[#6c7f95]">
+            none recorded (captions disabled, or not yet checked)
+          </div>
+          <div class="flex flex-wrap gap-1">
+            <template x-for="a in (detail.video.available_transcripts||[])" :key="a.language_code + a.kind">
+              <span class="pill bg-[#182231] text-[#9fb0c4]"
+                    x-text="a.language_code + ' · ' + a.kind + (a.is_translatable ? ' · translatable' : '')"></span>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="detail.transcripts.length" class="mb-2 flex flex-wrap gap-1">
+          <template x-for="t in detail.transcripts" :key="t.id">
+            <button class="btn text-[.6875rem]"
+                    :class="picked && picked.language_code===t.language_code && picked.kind===t.kind
+                            ? 'bg-[#1f3348] border-[#3b82f6]' : ''"
+                    @click="loadTranscript(t)"
+                    x-text="t.language_code + ' · ' + t.kind + (t.is_preferred ? ' ★' : '')"></button>
+          </template>
+        </div>
+
+        <template x-if="picked">
+          <div>
+            <div class="flex flex-wrap items-center gap-2 mb-2 text-[.6875rem] text-[#6c7f95] mono">
+              <span x-text="fmt(picked.segment_count) + ' segments'"></span>
+              <span x-text="fmt(picked.word_count) + ' words'"></span>
+              <span x-text="picked.covered_seconds + 's covered'"></span>
+              <span x-text="picked.source"></span>
+              <span x-show="!picked.file_present" class="text-[#fca5a5]">file missing on disk</span>
+            </div>
+            <div class="flex gap-1 mb-2">
+              <button class="btn text-[.6875rem]" @click="copyText()">copy</button>
+              <button class="btn text-[.6875rem]" @click="download('txt')">.txt</button>
+              <button class="btn text-[.6875rem]" @click="download('json')">.json</button>
+              <label class="flex items-center gap-1 text-[.6875rem] text-[#9fb0c4] ml-1">
+                <input type="checkbox" x-model="showTimestamps"> timestamps
+              </label>
+            </div>
+
+            <div class="card p-2 scroll" style="max-height:22rem">
+              <template x-if="showTimestamps && picked.segments?.length">
+                <div class="text-xs leading-relaxed space-y-.5">
+                  <template x-for="(s, i) in picked.segments" :key="i">
+                    <div class="flex gap-2">
+                      <!-- deep-links into the video at the cue's start -->
+                      <a :href="'https://www.youtube.com/watch?v=' + detail.video.video_id + '&t=' + Math.floor(s.start) + 's'"
+                         target="_blank" rel="noopener"
+                         class="mono text-[.6875rem] text-[#7dd3fc] hover:underline shrink-0 w-14 text-right"
+                         x-text="dur(s.start)"></a>
+                      <span x-text="s.text"></span>
+                    </div>
+                  </template>
+                </div>
+              </template>
+              <template x-if="!showTimestamps || !picked.segments?.length">
+                <p class="text-xs leading-relaxed whitespace-pre-wrap" x-text="picked.plaintext || ''"></p>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <div x-show="detail.transcripts.length && !picked" class="text-xs text-[#6c7f95]">
+          Pick a language above to view the text.
+        </div>
+        <div x-show="!detail.transcripts.length" class="text-xs text-[#6c7f95]">
+          No transcript stored for this video.
+        </div>
+
+        <div x-show="detail.attempts?.length" class="mt-4">
+          <div class="text-[.6875rem] uppercase tracking-wider text-[#7d8ea4] mb-1">Recent attempts</div>
+          <div class="space-y-1">
+            <template x-for="(a, i) in detail.attempts" :key="i">
+              <div class="text-[.6875rem] mono flex gap-2">
+                <span class="text-[#5c6f86]" x-text="clock(a.started_at)"></span>
+                <span :class="a.outcome==='ok' ? 'text-[#6ee7b7]'
+                              : a.outcome==='blocked' ? 'text-[#fca5a5]'
+                              : a.outcome==='terminal' ? 'text-[#fcd34d]' : 'text-[#9fb0c4]'"
+                      x-text="a.outcome"></span>
+                <span class="text-[#6c7f95] truncate"
+                      x-text="[a.error_type, a.http_status, a.error_message].filter(Boolean).join(' ')"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </template>
+  </aside>
+</div>
+
+<script>
+const MAX_LOG_LINES = 2000;   // hard DOM ring buffer; see the header comment
+const STATUS_COLORS = {
+  discovered:'#475569', metadata_ok:'#3b82f6', transcript_ok:'#22c55e',
+  no_transcript:'#eab308', lang_missing:'#f97316', unavailable:'#64748b',
+  age_restricted:'#a855f7', skipped:'#334155', retry:'#06b6d4', failed:'#ef4444',
+};
+
+function app() {
+  return {
+    stats: {}, channels: [], runs: [], videos: [], knobs: [], values: {}, dirty: {},
+    bootstrap: {}, secretKeys: [], liveKeys: [],
+    drill: null, detail: null, picked: null, showTimestamps: false,
+    videoFilter: { status:'', sort:'published_desc', q:'' },
+    videoPage: 1, videoPages: 1, videoTotal: 0,
+    logs: [], logLevel: 'all', logSearch: '', autoscroll: true, logHeight: 220,
+    sse: null, sseState: 'idle', followRun: 0, lastSeq: 0,
+    startForm: { command:'run', incremental:false, hydrate:false },
+    channelInput: '', busy: false, alert: '',
+    stopElapsed: null, lastEscalation: '', stopTimer: null,
+    statusOrder: ['transcript_ok','metadata_ok','discovered','retry','no_transcript',
+                  'lang_missing','age_restricted','skipped','unavailable','failed'],
+
+    // ── lifecycle ────────────────────────────────────────────────────────
+    async boot() {
+      this.token = localStorage.getItem('yt_tx_token') || '';
+      await Promise.all([this.loadStats(), this.loadChannels(), this.loadSettings(), this.loadRuns()]);
+      if (this.stats.active_run) this.attachStream(this.stats.active_run.id);
+      setInterval(() => this.loadStats(), 2000);
+      setInterval(() => this.loadChannels(), 10000);
+    },
+
+    // ── http ─────────────────────────────────────────────────────────────
+    async api(path, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
+      const response = await fetch('/api' + path, { ...options, headers });
+      if (response.status === 401) {
+        const token = prompt('Auth token required (web.auth_token in config.yaml):');
+        if (token) { localStorage.setItem('yt_tx_token', token); this.token = token; }
+        throw new Error('unauthorized');
+      }
+      if (!response.ok) {
+        let detail = response.statusText;
+        try { detail = (await response.json()).detail || detail; } catch (e) {}
+        throw new Error(detail);
+      }
+      return response.status === 204 ? null : response.json();
+    },
+    async guard(fn) {
+      this.busy = true;
+      try { return await fn(); }
+      catch (e) { this.alert = String(e.message || e); }
+      finally { this.busy = false; }
+    },
+
+    async loadStats() {
+      try {
+        const previous = this.stats.desired_state;
+        this.stats = await this.api('/stats');
+        if (this.stats.desired_state === 'stopping' && this.stats.run_alive) {
+          this.trackStop();
+        } else if (previous === 'stopping') {
+          this.stopElapsed = null; this.lastEscalation = '';
+          if (this.stopTimer) { clearInterval(this.stopTimer); this.stopTimer = null; }
+        }
+        // Follow whatever run is live, unless the user picked one deliberately.
+        const active = this.stats.active_run;
+        if (active && this.stats.run_alive && this.followRun !== active.id && !this.pinned) {
+          this.attachStream(active.id);
+        }
+      } catch (e) { /* transient: the poller retries in 2s */ }
+    },
+    async loadChannels() { try { this.channels = await this.api('/channels'); } catch (e) {} },
+    async loadRuns() { try { this.runs = await this.api('/runs?limit=50'); } catch (e) {} },
+    async loadSettings() {
+      const payload = await this.api('/settings');
+      this.knobs = payload.knobs;
+      this.values = payload.values;
+      this.secretKeys = payload.secret_keys;
+      this.liveKeys = payload.live_keys;
+      this.bootstrap = payload.bootstrap;
+      this.dirty = {};
+    },
+
+    // ── knobs ────────────────────────────────────────────────────────────
+    knobGroups() { return [...new Set(this.knobs.map(k => k.group))]; },
+    knobsIn(group) { return this.knobs.filter(k => k.group === group); },
+    tierLabel(tier) { return tier === 'live' ? '⚡ LIVE' : tier === 'secret' ? '🔒 SECRET' : '↻ NEXT RUN'; },
+    tierClass(tier) { return tier === 'live' ? 'tier-live' : tier === 'secret' ? 'tier-secret' : 'tier-next'; },
+    touch(key) { this.dirty[key] = true; },
+    dirtyCount() { return Object.keys(this.dirty).length; },
+    joinList(value) { return Array.isArray(value) ? value.join(', ') : (value ?? ''); },
+
+    async saveSettings() {
+      await this.guard(async () => {
+        const payload = {};
+        for (const key of Object.keys(this.dirty)) payload[key] = this.values[key];
+        const result = await this.api('/settings', {
+          method:'PUT', body: JSON.stringify({ values: payload }),
+        });
+        this.values = result.values;
+        this.dirty = {};
+        this.alert = result.applied_live.length
+          ? 'Saved. Live now: ' + result.applied_live.join(', ') + '. The rest apply next run.'
+          : 'Saved — applies to the next run.';
+        setTimeout(() => { if (this.alert.startsWith('Saved')) this.alert = ''; }, 4000);
+      });
+    },
+
+    // ── channels ─────────────────────────────────────────────────────────
+    async addChannels() {
+      await this.guard(async () => {
+        const refs = this.channelInput.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+        const result = await this.api('/channels', { method:'POST', body: JSON.stringify({ refs }) });
+        this.channelInput = '';
+        await this.loadChannels();
+        if (result.errors.length) {
+          this.alert = 'Could not resolve: ' + result.errors.map(e => e.ref + ' (' + e.error + ')').join('; ');
+        }
+      });
+    },
+    async toggleChannel(channel) {
+      await this.guard(async () => {
+        await this.api('/channels/' + channel.channel_id, {
+          method:'PATCH', body: JSON.stringify({ is_enabled: !channel.is_enabled }),
+        });
+        await this.loadChannels();
+      });
+    },
+    async removeChannel(channel) {
+      if (!confirm('Delete ' + (channel.handle || channel.channel_id) + ' and its ' +
+                   channel.total + ' video rows?\n\nTranscript files stay on disk; ' +
+                   '`yt-tx doctor` can reclaim them.')) return;
+      await this.guard(async () => {
+        await this.api('/channels/' + channel.channel_id, { method:'DELETE' });
+        if (this.drill?.channel_id === channel.channel_id) this.closeChannel();
+        await this.loadChannels();
+      });
+    },
+
+    // ── runs ─────────────────────────────────────────────────────────────
+    async startRun() {
+      await this.guard(async () => {
+        const result = await this.api('/runs', {
+          method:'POST',
+          body: JSON.stringify({
+            command: this.startForm.command,
+            incremental: this.startForm.incremental,
+            skip_hydrate: !this.startForm.hydrate,
+            channel_id: this.drill?.channel_id || null,
+          }),
+        });
+        this.pinned = false;
+        this.logs = [];
+        await this.loadRuns();
+        this.attachStream(result.run_id);
+      });
+    },
+    async pauseResume() {
+      const run = this.stats.active_run; if (!run) return;
+      const action = this.stats.desired_state === 'paused' ? 'resume' : 'pause';
+      await this.guard(() => this.api('/runs/' + run.id + '/' + action, { method:'POST' }));
+      await this.loadStats();
+    },
+    async stopRun() {
+      const run = this.stats.active_run; if (!run) return;
+      if (!confirm('Stop run ' + run.id + '? In-flight work finishes and commits first.')) return;
+      await this.guard(() => this.api('/runs/' + run.id + '/stop', { method:'POST' }));
+      await this.loadStats();
+    },
+    trackStop() {
+      if (this.stopTimer) return;
+      const run = this.stats.active_run; if (!run) return;
+      this.stopTimer = setInterval(async () => {
+        try {
+          // Escalation is driven from the server, which owns the elapsed clock.
+          const result = await this.api('/runs/' + run.id + '/escalate', { method:'POST' });
+          this.stopElapsed = Math.round(result.elapsed ?? 0);
+          if (result.action && result.action !== 'waiting') this.lastEscalation = result.action + ' sent';
+          if (result.action === 'already exited' || result.action === 'sigkill') {
+            clearInterval(this.stopTimer); this.stopTimer = null;
+          }
+        } catch (e) { clearInterval(this.stopTimer); this.stopTimer = null; }
+      }, 3000);
+    },
+
+    // ── videos ───────────────────────────────────────────────────────────
+    openChannel(channel) { this.drill = channel; this.videoFilter.status = ''; this.loadVideos(1); },
+    closeChannel() { this.drill = null; this.detail = null; this.videos = []; },
+    filterStatus(status) {
+      this.videoFilter.status = status;
+      if (!this.drill) this.drill = { channel_id: null, handle: 'all channels' };
+      this.loadVideos(1);
+    },
+    async loadVideos(page) {
+      if (page < 1) return;
+      await this.guard(async () => {
+        const params = new URLSearchParams({ page, per_page: 50, sort: this.videoFilter.sort });
+        if (this.drill?.channel_id) params.set('channel_id', this.drill.channel_id);
+        if (this.videoFilter.status) params.set('status', this.videoFilter.status);
+        if (this.videoFilter.q) params.set('q', this.videoFilter.q);
+        const payload = await this.api('/videos?' + params);
+        this.videos = payload.videos;
+        this.videoPage = payload.page;
+        this.videoPages = payload.pages;
+        this.videoTotal = payload.total;
+      });
+    },
+    async openVideo(video) {
+      await this.guard(async () => {
+        this.detail = await this.api('/videos/' + video.video_id);
+        this.picked = null;
+        const preferred = this.detail.transcripts.find(t => t.is_preferred) || this.detail.transcripts[0];
+        if (preferred) await this.loadTranscript(preferred);
+      });
+    },
+    async loadTranscript(transcript) {
+      const params = new URLSearchParams({ lang: transcript.language_code, kind: transcript.kind });
+      this.picked = await this.api('/videos/' + this.detail.video.video_id + '/transcript?' + params);
+    },
+    async refetch(videoId) {
+      await this.guard(async () => {
+        await this.api('/videos/' + videoId + '/refetch', { method:'POST' });
+        this.alert = videoId + ' queued for re-fetch; it will be picked up by the next fetch run.';
+        if (this.drill) await this.loadVideos(this.videoPage);
+      });
+    },
+    // One file, every transcript, concatenated server-side and streamed - so a
+    // 15k-video corpus never has to fit in a browser Blob the way download()
+    // below does for a single video.
+    exportUrl(fmt) {
+      const params = new URLSearchParams({ format: fmt });
+      if (this.drill?.channel_id) params.set('channel_id', this.drill.channel_id);
+      if (this.token) params.set('token', this.token);
+      return '/api/export?' + params.toString();
+    },
+    copyText() { navigator.clipboard.writeText(this.picked?.plaintext || ''); },
+    download(kind) {
+      const video = this.detail.video.video_id;
+      const body = kind === 'txt'
+        ? (this.picked.plaintext || '')
+        : JSON.stringify(this.picked.segments || [], null, 2);
+      const blob = new Blob([body], { type: kind === 'txt' ? 'text/plain' : 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = video + '.' + this.picked.language_code + '.' + kind;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    },
+
+    // ── log stream ───────────────────────────────────────────────────────
+    attachStream(runId) {
+      if (!runId) return;
+      if (this.sse) { this.sse.close(); this.sse = null; }
+      if (runId !== this.stats.active_run?.id) this.pinned = true;
+      this.followRun = runId;
+      this.logs = [];
+      this.lastSeq = 0;
+      this.sseState = 'connecting';
+
+      // Backfill first so a run that is already underway is not missing its
+      // history, then stream from where the backfill stopped.
+      this.api('/runs/' + runId + '/logs?since=0').then(payload => {
+        this.pushLogs(payload.lines);
+      }).catch(() => {}).finally(() => {
+        const query = this.token ? '?token=' + encodeURIComponent(this.token) : '';
+        const source = new EventSource('/api/runs/' + runId + '/logs/stream' + query);
+        source.onopen = () => { this.sseState = 'open'; };
+        source.onmessage = event => {
+          try { this.pushLogs([JSON.parse(event.data)]); } catch (e) {}
+        };
+        // EventSource reconnects on its own and replays Last-Event-ID, so the
+        // gap is filled server-side without any work here.
+        source.onerror = () => { this.sseState = 'reconnecting'; };
+        this.sse = source;
+      });
+    },
+    pushLogs(lines) {
+      if (!lines?.length) return;
+      for (const line of lines) {
+        if (line.seq && line.seq <= this.lastSeq) continue;
+        this.lastSeq = Math.max(this.lastSeq, line.seq || 0);
+        this.logs.push(line);
+      }
+      if (this.logs.length > MAX_LOG_LINES) {
+        this.logs.splice(0, this.logs.length - MAX_LOG_LINES);
+      }
+      if (this.autoscroll) {
+        this.$nextTick(() => {
+          const box = this.$refs.logbox;
+          if (box) box.scrollTop = box.scrollHeight;
+        });
+      }
+    },
+    visibleLogs() {
+      const needle = this.logSearch.toLowerCase();
+      return this.logs.filter(line => {
+        const level = line.level || 'info';
+        if (this.logLevel === 'info' && level === 'debug') return false;
+        if (this.logLevel === 'warning' && !['warning','error','critical'].includes(level)) return false;
+        if (this.logLevel === 'error' && !['error','critical'].includes(level)) return false;
+        if (!needle) return true;
+        return JSON.stringify(line).toLowerCase().includes(needle);
+      });
+    },
+    extras(line) {
+      const skip = new Set(['event','level','ts','seq','logger','run_id','worker','raw','exception']);
+      return Object.entries(line)
+        .filter(([k, v]) => !skip.has(k) && v !== null && v !== '')
+        .map(([k, v]) => k + '=' + (typeof v === 'object' ? JSON.stringify(v) : v))
+        .join(' ');
+    },
+
+    // ── formatting ───────────────────────────────────────────────────────
+    fmt(n) { return (n ?? 0).toLocaleString(); },
+    dur(seconds) {
+      if (seconds === null || seconds === undefined) return '—';
+      const s = Math.floor(seconds);
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      return h ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+               : `${m}:${String(sec).padStart(2,'0')}`;
+    },
+    clock(ts) { return ts ? String(ts).slice(11, 19) : ''; },
+    done() { return this.stats.by_status?.transcript_ok || 0; },
+    pctOf(status) {
+      const total = this.stats.total || 0;
+      return total ? 100 * (this.stats.by_status?.[status] || 0) / total : 0;
+    },
+    statusColor(status) { return STATUS_COLORS[status] || '#475569'; },
+    quotaPct() { return this.stats.quota?.pct ?? 0; },
+    etaText() {
+      const eta = this.stats.eta_seconds; if (!eta) return '—';
+      const mins = v => v < 60 ? v + 's' : v < 5400 ? Math.round(v/60) + 'm' : (v/3600).toFixed(1) + 'h';
+      return mins(eta.low) + '–' + mins(eta.high);
+    },
+    stateDot() {
+      const state = this.stats.state;
+      return state === 'running' ? '●' : state === 'paused' ? '❙❙' : state === 'stopping' ? '◐' : '○';
+    },
+    stateColor() {
+      const state = this.stats.state;
+      return state === 'running' ? 'text-[#22c55e]'
+           : state === 'paused' ? 'text-[#eab308]'
+           : state === 'stopping' ? 'text-[#f97316]' : 'text-[#64748b]';
+    },
+    breakerLabel() {
+      // Reported by the worker in its heartbeat, not scraped out of log text.
+      return this.stats.breaker?.state || 'closed';
+    },
+    breakerClass() {
+      const label = this.breakerLabel();
+      return label === 'closed' ? 'bg-[#182231] text-[#9fb0c4]'
+           : label === 'exhausted' ? 'bg-[#5c1a1a] text-[#ffd9d9]'
+           : 'bg-[#5a3d0b] text-[#ffe9c2]';
+    },
+  };
+}
+</script>
+</body>
+</html>

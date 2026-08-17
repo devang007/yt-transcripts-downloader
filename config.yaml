@@ -1,0 +1,60 @@
+# Bootstrap configuration.
+#
+# Two tiers live in this file:
+#   * Bootstrap-only (mysql, transcript_dir, log_dir, web) - read from YAML on
+#     every process start. They cannot live in the DB, because you need them to
+#     reach the DB in the first place.
+#   * Seed values for the `settings` table - written once by `yt-tx init`.
+#     After that the UI is the source of truth and edits here are ignored
+#     unless you run `yt-tx init --reseed`.
+#
+# ${VAR} is expanded from the environment (and from .env, if present).
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  database: yt_tx
+  user: yt_tx
+  password: ${MYSQL_PASSWORD}
+  charset: utf8mb4
+  pool_size: 5
+  pool_recycle: 3600
+
+transcript_dir: data/transcripts
+log_dir: logs
+
+languages: [en, en-US, en-GB, hi]      # preference order
+prefer_manual: true
+store_all_variants: false
+accept_translated: false
+
+include_shorts: true
+include_streams: false
+max_duration_seconds: 43200            # 12h
+
+concurrency: 3
+requests_per_second: 0.66
+burst: 3
+jitter: 0.3
+max_attempts: 4
+backoff_base_seconds: 2
+backoff_cap_seconds: 300
+lease_seconds: 600
+
+circuit_breaker:
+  consecutive_blocks_to_open: 3
+  cooldown_schedule_seconds: [300, 600, 1200, 2400, 3600]
+  max_reopens: 5
+
+youtube_api_key: ${YOUTUBE_API_KEY}
+daily_quota_units: 10000
+quota_stop_at_pct: 90
+
+fetcher: youtube-transcript-api        # or yt-dlp
+cookies_file: null
+proxy: null
+
+web:
+  host: 127.0.0.1
+  port: 8000
+  auth_token: null                     # required if host != 127.0.0.1

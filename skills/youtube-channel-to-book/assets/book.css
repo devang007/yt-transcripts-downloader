@@ -1,0 +1,110 @@
+/* Book stylesheet — screen and print. Self-contained, no external fonts. */
+
+:root {
+  --ink: #1a1a1a;
+  --muted: #5c5c5c;
+  --rule: #d8d4cc;
+  --accent: #0d5c4d;
+  --note-bg: #f4f1ea;
+  --note-border: #b8a982;
+  --measure: 34em;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #faf9f6;
+  color: var(--ink);
+  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-size: 17px;
+  line-height: 1.62;
+}
+
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 4rem 1.5rem 6rem;
+}
+
+h1, h2, h3, h4 {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  line-height: 1.22;
+  color: var(--ink);
+  margin: 2.4em 0 0.7em;
+  font-weight: 700;
+}
+
+h1 { font-size: 2.05rem; letter-spacing: -0.02em; margin-top: 0; }
+h2 { font-size: 1.45rem; padding-bottom: 0.3em; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.14rem; color: var(--accent); }
+h4 { font-size: 1rem; color: var(--muted); text-transform: uppercase;
+     letter-spacing: 0.06em; }
+
+p { margin: 0 0 1.05em; }
+
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(13,92,77,.3); }
+a:hover { border-bottom-color: var(--accent); }
+
+/* Source markers stay legible but out of the way */
+sup.cite {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.62em;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  padding: 0 0.12em;
+  white-space: nowrap;
+}
+
+/* Tier B — editorial explanation. Must look unmistakably different. */
+blockquote.editor-note {
+  margin: 1.8em 0;
+  padding: 1.05em 1.3em;
+  background: var(--note-bg);
+  border-left: 4px solid var(--note-border);
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+blockquote.editor-note p:last-child { margin-bottom: 0; }
+blockquote.editor-note strong:first-child { color: #6b5a2e; }
+
+ul { margin: 0 0 1.15em; padding-left: 1.3em; }
+li { margin-bottom: 0.42em; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.6em 0;
+  font-size: 0.87em;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+th, td { text-align: left; padding: 0.5em 0.65em; border-bottom: 1px solid var(--rule);
+         vertical-align: top; }
+th { background: #f0ede6; font-weight: 600; }
+td code { font-size: 0.9em; }
+
+pre {
+  background: #f0ede6;
+  padding: 1em 1.2em;
+  overflow-x: auto;
+  border-radius: 3px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.88em; }
+
+img { max-width: 100%; height: auto; display: block; margin: 1.8em auto; }
+
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3em 0; }
+
+@media print {
+  body { background: #fff; font-size: 11pt; }
+  main { max-width: none; padding: 0; }
+  h1 { page-break-before: always; }
+  h1:first-of-type { page-break-before: avoid; }
+  h2, h3 { page-break-after: avoid; }
+  blockquote.editor-note, table, img, pre { page-break-inside: avoid; }
+  a { color: var(--ink); border: 0; }
+  @page { size: A5; margin: 18mm 16mm; }
+}
