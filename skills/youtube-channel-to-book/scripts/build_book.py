@@ -20,13 +20,25 @@ from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
-CITE_RE = re.compile(r"\[((?:EV-\d{4,}(?:,\s*)?)+)\]")
+EV_ID = r"EV-(?:[A-Za-z0-9_-]{11}-\d{2,}|\d{4,})"
+LIST_RE = re.compile(r"^\s*[-*]\s+")
+CITE_RE = re.compile(r"\[((?:" + EV_ID + r"(?:,\s*)?)+)\]")
+
+def is_internal(path):
+    """True for the phase's own bookkeeping files, false for real card files.
+
+    A YouTube video ID is exactly 11 characters and is allowed to begin with
+    an underscore, so a leading "_" alone cannot be the test — using it silently
+    hides real cards. Length is what actually separates the two.
+    """
+    return path.stem.startswith("_") and len(path.stem) != 11
+
 
 
 def load_cards(proj):
     cards = {}
     for path in (proj / "cards").glob("*.jsonl"):
-        if path.name.startswith("_"):
+        if is_internal(path):
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -182,11 +194,24 @@ def to_html(md_text, title, css):
         s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
         s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
         s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
-        s = re.sub(r"\b(EV-\d{4,})\b", r'<sup class="cite">\1</sup>', s)
+        s = re.sub(r"(?<![\w-])(" + EV_ID + r")(?![\w-])",
+                   r'<sup class="cite">\1</sup>', s)
         return s
+
+    def flush_para():
+        """Emit buffered lines as ONE paragraph.
+
+        Markdown joins consecutive non-blank lines into a single paragraph and
+        only breaks on a blank line. Emitting one <p> per source line is what
+        shattered the PDF into thousands of one-line paragraphs.
+        """
+        if para:
+            out.append(f"<p>{' '.join(para)}</p>")
+            para.clear()
 
     def close_blocks():
         nonlocal in_table, in_list, in_quote
+        flush_para()
         if in_table:
             out.append("</tbody></table>")
             in_table = False
@@ -197,6 +222,7 @@ def to_html(md_text, title, css):
             out.append("</blockquote>")
             in_quote = False
 
+    para = []
     for line in md_text.split("\n"):
         if line.strip().startswith("```"):
             close_blocks()
@@ -239,17 +265,19 @@ def to_html(md_text, title, css):
                 close_blocks()
                 out.append('<blockquote class="editor-note">')
                 in_quote = True
-            out.append(f"<p>{inline(line.lstrip('> '))}</p>")
+            para.append(inline(line.lstrip('> ')))
             continue
-        if re.match(r"^\s*[-*]\s+", line):
+        if LIST_RE.match(line):
+            flush_para()
             if not in_list:
                 close_blocks()
                 out.append("<ul>")
                 in_list = True
-            out.append(f"<li>{inline(re.sub(r'^\\s*[-*]\\s+', '', line))}</li>")
+            out.append(f"<li>{inline(LIST_RE.sub('', line))}</li>")
             continue
-        close_blocks()
-        out.append(f"<p>{inline(line)}</p>")
+        if in_table or in_list or in_quote:
+            close_blocks()
+        para.append(inline(line))
     close_blocks()
     body = "\n".join(out)
     return (f"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"

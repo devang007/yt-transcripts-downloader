@@ -18,9 +18,14 @@ Convert an entire channel's transcripts into a book a reader can learn from — 
 Run these in order. Each phase writes to disk so work survives context resets and can resume.
 
 ```
-transcripts/ → [1 ingest] → corpus/ → [2 extract] → cards/ → [3 ledger] →
-ledger/ → [4 outline] → outline.md → [5 draft] → chapters/ → [6 verify] → [7 build] → book/
+transcripts/ → [1 ingest] → corpus/ → [2a skim ALL] → cards_skim/ → [3 ledger] →
+ledger/ → [4 outline + deep_set] → [2b deep-extract SELECTED] → cards/ →
+[5 draft] → chapters/ → [6 verify] → [7 build] → book/
 ```
+
+`worklist.py` computes the remaining work for every phase by reading the output
+directory. Run it before launching agents, and after — never hand-maintain a list
+of what is left.
 
 Create the project scaffold first:
 
@@ -38,6 +43,22 @@ Sort the manifest chronologically. Chronology matters: it's how you detect that 
 
 ### Phase 2 — Extract evidence cards (the map step)
 
+**Extract in two passes, not one.** The ledger only needs topic tags and enough
+cards to count distinct videos per topic; it does not need 25 fully-conditioned
+cards from a promo video no chapter will ever cite. On the previous book, ~90% of
+extracted cards were never cited.
+
+- **2a — skim, every video.** Topics plus 3–5 cards each, into `cards_skim/`.
+  Purely to build the ledger weights. Cheap model, low effort.
+- **2b — deep, selected videos only.** After the outline is signed off, write the
+  shortlist the approved chapters actually draw on to `ledger/deep_set.json`
+  (`{"video_ids": [...]}`) and extract those properly into `cards/`.
+
+Before 2a, prune with a script rather than an agent: drop date-stamped ephemera
+(daily market analysis, "analysis for tomorrow"), collapse duplicate-title clusters
+to one representative and carry the cluster size as the repetition weight, and
+treat shorts as skim-only. This is free and routinely removes 20–30% of a channel.
+
 Read `references/extraction.md` before starting this phase. It contains the card schema, the type taxonomy, and worked examples.
 
 Process videos one at a time (or in small batches for short videos), reading each transcript from `corpus/videos/`. For each, emit JSONL evidence cards to `cards/<video_id>.jsonl`. A card is one atomic claim with:
@@ -51,7 +72,18 @@ Process videos one at a time (or in small batches for short videos), reading eac
 
 Extraction is where fidelity is won or lost. Two habits matter most: **write down what the creator actually said, not the nearest well-known version of it** (if he says he waits for a close beyond the level, do not upgrade that to "waits for a retest and close beyond" because that's the more common formulation), and **capture conditions** — "cut risk in half" is useless without "on FOMC days".
 
-Track progress in `cards/_progress.json` so the phase can resume. After every ~20 videos, run `python scripts/cards.py stats --project <dir>` and show the user the emerging topic distribution. This is the earliest point where a wrong taxonomy becomes visible and cheap to fix.
+Write `cards/<video_id>.jsonl` immediately on finishing each video — one file per
+video, never a batch-wide file. If a video genuinely yields nothing, write an
+**empty** `.jsonl` anyway and log the reason in `cards/_no_cards.jsonl`: an absent
+file means "not done", and conflating the two is how videos get silently lost.
+Never derive progress from anything but these files. Run `python scripts/cards.py anchors --project <dir>` after every batch. It checks
+each anchor against the transcript and reports the verbatim rate. An anchor that is
+*close but altered* is the quiet failure mode: the model normalised the creator's
+words while claiming to quote them, and nothing downstream will catch it. Treat a
+verbatim rate below ~95% as a signal that the extraction model is too weak for this
+corpus, not as a batch to patch up.
+
+After every ~20 videos, run `python scripts/cards.py stats --project <dir>` and show the user the emerging topic distribution. This is the earliest point where a wrong taxonomy becomes visible and cheap to fix.
 
 ### Phase 3 — Build the concept ledger (the reduce step)
 
@@ -123,8 +155,56 @@ Assembles front matter, TOC, chapters, and the required back matter: a **Source 
 
 The Source Index is not bureaucratic overhead — it's the feature that makes the book trustworthy. A reader who doubts a paragraph can be watching the exact second of the exact video in ten seconds.
 
+## Cost control and model routing
+
+Extraction dominates the budget: it is ~85% of the tokens a book like this costs.
+It is also a mechanical transform, which is the cheapest kind of work to route.
+
+| Phase | Model | Why |
+|---|---|---|
+| 1 ingest, prune, cluster | none / cheapest | scripts and title classification |
+| 2a skim | cheap tier, low effort | mechanical, high volume |
+| 3 ledger | none | script |
+| 4 outline | strongest tier | pure judgment, one agent, tiny |
+| 2b deep extract | cheap tier, medium effort | mechanical, validated by sample |
+| 5 draft | strongest tier | this is the visible product |
+| 6 verify (mechanical) | none | script |
+| 6 verify (semantic sample) | strongest tier | subtle judgment; where it pays |
+| 7 build | none | script |
+
+**Set the model explicitly on every extraction agent.** A subagent inherits the
+orchestrator's model when the parameter is omitted, so forgetting it silently runs
+the whole map step on the expensive tier — not a wrong choice, an unmade one.
+
+**Validate the cheap tier before committing to it**, on ~12-15 videos, diffed
+against the strong tier. Score it mechanically with `cards.py anchors` (verbatim
+rate) and by conditions-fill rate, not by reading the agents' own reports — a model
+that writes a confident report while normalising anchors is the worst case, and only
+the substring check separates it from a good one.
+
+Re-run this validation whenever the corpus changes character. **An English-language
+result does not transfer to a non-English channel.** On a Hinglish trading channel
+the cheap tier held a 86% verbatim rate against the strong tier's 99%, and filled
+`conditions` on 63% of cards against 100% — degrading precisely on the two fields
+that make the difference between a useful book and a dangerous one, while its prose
+reports still read as authoritative.
+
+**Cap concurrency deliberately.** Small waves that checkpoint to disk turn a rate
+limit into a pause; one large burst turns it into lost work.
+
 ## Standing rules
 
+- **Separate reading progress from claiming work.** A launcher that hands out work
+  must also mark it in-flight, or a second launcher re-hands the same batch while the
+  first agent is still working — the completed-file check cannot see an agent that has
+  not written anything yet. But a claim is a promise that a launch followed, so the
+  claiming command must never sit inside a status loop or a background waiter. Keep a
+  read-only status command that claims nothing, and a release path for undoing a claim
+  whose launch never happened.
+- **The disk is the source of truth, in every phase.** Every launcher recomputes
+  its work list from the output directory immediately before spawning, and never
+  from a spec generated earlier in the run. Drafting needs this exactly as much as
+  extraction does — skipping it there redrew three finished chapters on the last book.
 - **Attribute the work.** Front matter states plainly that this is an independent study guide derived from [Channel]'s public videos, links the channel, and notes it isn't affiliated with or endorsed by the creator. If the user plans to distribute or sell it, tell them once that a derivative work like this needs the creator's permission, and that the safe version is heavily synthesized commentary with links back to the originals rather than a transcript rehash.
 - **Never invent numbers.** Win rates, R multiples, backtest results, price levels — if it isn't in a card, it doesn't go in the book, not even as "typically around...".
 - **Preserve hedges.** If he says "I usually" or "this doesn't always work", the book says that too. Sanding hedges off is how a nuanced method turns into dangerous-sounding dogma.
@@ -145,7 +225,9 @@ The Source Index is not bureaucratic overhead — it's the feature that makes th
 | Script | Purpose |
 |---|---|
 | `scripts/ingest.py` | Normalize subtitle formats, dedupe rolling captions, build manifest |
+| `scripts/worklist.py` | What is left per phase (`todo`), and what was scheduled but produced nothing (`audit`) |
 | `scripts/cards.py` | Validate cards, build ledger, fetch by topic, stats, coverage |
+| `scripts/prune.py` | Ephemera, near-duplicate clusters and thin videos — the plan for what to extract |
 | `scripts/verify.py` | Citation resolution, uncited-claim detection, quote-length audit |
 | `scripts/build_book.py` | Assemble chapters + back matter into MD/HTML/PDF |
 

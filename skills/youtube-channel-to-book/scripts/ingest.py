@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import html
 import json
 import os
@@ -20,7 +21,15 @@ TIME_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})")
 TAG_RE = re.compile(r"<[^>]+>")
 # yt-dlp default naming: "Title [videoid].en.vtt"
 ID_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+BARE_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 DATE_RE = re.compile(r"(20\d{2})[-.]?(\d{2})[-.]?(\d{2})")
+
+
+def topen(path):
+    """Open a transcript, transparently decompressing .gz."""
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
 
 
 def hms_to_seconds(h, m, s, ms="0"):
@@ -42,7 +51,7 @@ def clean_text(line):
 def parse_vtt_srt(path):
     """Return [(seconds, text)] from a WebVTT or SRT file."""
     cues = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with topen(path) as fh:
         raw = fh.read()
     raw = raw.replace("\r\n", "\n").replace("\ufeff", "")
     for block in re.split(r"\n\s*\n", raw):
@@ -75,7 +84,7 @@ def parse_vtt_srt(path):
 
 
 def parse_json(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with topen(path) as fh:
         try:
             data = json.load(fh)
         except json.JSONDecodeError:
@@ -86,6 +95,12 @@ def parse_json(path):
         for seg in data:
             if isinstance(seg, dict) and "text" in seg:
                 cues.append((float(seg.get("start", 0)), clean_text(str(seg["text"]))))
+    # yt-tx / youtube-transcript-api archive: {"segments":[{"start","duration","text"}]}
+    elif isinstance(data, dict) and "segments" in data:
+        for seg in data["segments"]:
+            text = clean_text(str(seg.get("text", "")))
+            if text:
+                cues.append((float(seg.get("start", 0)), text))
     # yt-dlp json3: {"events":[{"tStartMs":..,"segs":[{"utf8":..}]}]}
     elif isinstance(data, dict) and "events" in data:
         for ev in data["events"]:
@@ -99,7 +114,7 @@ def parse_json(path):
 def parse_txt(path):
     """Plain text; recover inline [MM:SS] or (HH:MM:SS) markers if present."""
     cues = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with topen(path) as fh:
         current = 0.0
         for line in fh:
             m = re.match(r"^\s*[\[\(]?(\d{1,2}):(\d{2})(?::(\d{2}))?[\]\)]?\s+(.*)", line)
@@ -161,7 +176,24 @@ def to_paragraphs(cues, block_seconds=30):
     return blocks
 
 
+def sidecar_meta(path):
+    """Load an optional {video_id: {title, published, duration_seconds, views}} map.
+
+    Filenames only ever carry the video ID, so real titles and upload dates have to
+    come from somewhere else. Without them the ledger cannot span dates and the
+    outline cannot detect that the creator's method changed in 2023.
+    """
+    if not path:
+        return {}
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
 def extract_meta(path):
+    # Archive naming "<video_id>.<lang>.<kind>.json[.gz]" — the ID is the first
+    # dot-separated field, and a YouTube ID is exactly 11 characters.
+    head = path.name.split(".")[0]
+    if BARE_ID_RE.fullmatch(head):
+        return head, head, None
     name = path.stem
     for suffix in (".en", ".en-US", ".en-GB", ".auto", ".live_chat"):
         if name.endswith(suffix):
@@ -187,6 +219,9 @@ def main():
     ap.add_argument("--project", required=True, help="project directory to create")
     ap.add_argument("--block-seconds", type=int, default=30,
                     help="seconds per timestamped paragraph (default 30)")
+    ap.add_argument("--metadata", help="JSON map video_id -> {title, published, "
+                                       "duration_seconds, views}; supplies the real "
+                                       "titles and dates filenames cannot carry")
     ap.add_argument("--min-words", type=int, default=150,
                     help="flag videos shorter than this as likely non-content")
     args = ap.parse_args()
@@ -201,22 +236,30 @@ def main():
 
     parsers = {".vtt": parse_vtt_srt, ".srt": parse_vtt_srt,
                ".json": parse_json, ".txt": parse_txt, ".md": parse_txt}
+    meta_map = sidecar_meta(args.metadata)
+
+    def real_suffix(p):
+        """Suffix ignoring a trailing .gz, so foo.json.gz parses as JSON."""
+        return Path(p.stem).suffix.lower() if p.suffix.lower() == ".gz" else p.suffix.lower()
 
     manifest, failures = [], []
-    files = sorted(p for p in src.rglob("*") if p.suffix.lower() in parsers)
+    files = sorted(p for p in src.rglob("*") if real_suffix(p) in parsers)
     if not files:
         sys.exit(f"No .vtt/.srt/.json/.txt files found under {src}")
 
     seen_ids = {}
     for path in files:
         try:
-            cues = parsers[path.suffix.lower()](path)
+            cues = parsers[real_suffix(path)](path)
             if not cues:
                 failures.append({"file": str(path), "reason": "no cues parsed"})
                 continue
             cues = dedupe_rolling(cues)
             blocks = to_paragraphs(cues, args.block_seconds)
             vid, title, date = extract_meta(path)
+            meta = meta_map.get(vid, {}) if vid else {}
+            title = meta.get("title") or title
+            date = (meta.get("published") or date)
             if not vid:
                 vid = re.sub(r"[^A-Za-z0-9]+", "_", path.stem)[:40]
             if vid in seen_ids:
@@ -227,16 +270,21 @@ def main():
 
             body = "\n\n".join(f"[{seconds_to_hms(s)}] {t}" for s, t in blocks)
             words = sum(len(t.split()) for _, t in blocks)
-            duration = int(cues[-1][0]) if cues else 0
+            duration = int(meta.get("duration_seconds") or (cues[-1][0] if cues else 0))
             out = proj / "corpus/videos" / f"{vid}.txt"
             header = (f"# {title}\nvideo_id: {vid}\npublished: {date or 'unknown'}\n"
                       f"duration: {seconds_to_hms(duration)}\nwords: {words}\n"
+                      + (f"views: {meta['views']}\n" if meta.get("views") else "")
+                      + (f"language: {meta['language']}\n" if meta.get("language") else "")
+                      + f"url: https://youtu.be/{vid}\n"
                       f"source_file: {path.name}\n\n---\n\n")
             out.write_text(header + body, encoding="utf-8")
 
             manifest.append({
                 "video_id": vid, "title": title, "published": date,
                 "duration_seconds": duration, "word_count": words,
+                "views": meta.get("views"), "language": meta.get("language"),
+                "is_short": meta.get("is_short"),
                 "path": str(out.relative_to(proj)), "source_file": str(path),
                 "url": f"https://youtu.be/{vid}" if len(vid) == 11 else None,
                 "flags": (["short"] if words < args.min_words else [])

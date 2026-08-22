@@ -9,6 +9,7 @@ dist/
 .coverage
 htmlcov/
 books/_adam-khoo-project/
+books/_booming-bulls-project/
 
 # Secrets and local state
 .env

@@ -24,7 +24,17 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-CITE_RE = re.compile(r"EV-\d{4,}")
+CITE_RE = re.compile(r"EV-(?:[A-Za-z0-9_-]{11}-\d{2,}|\d{4,})")
+
+def is_internal(path):
+    """True for the phase's own bookkeeping files, false for real card files.
+
+    A YouTube video ID is exactly 11 characters and is allowed to begin with
+    an underscore, so a leading "_" alone cannot be the test — using it silently
+    hides real cards. Length is what actually separates the two.
+    """
+    return path.stem.startswith("_") and len(path.stem) != 11
+
 QUOTE_RE = re.compile(r"[\"“]([^\"”]{2,})[\"”]")
 NUM_RE = re.compile(r"(?<![\w-])(\d+(?:\.\d+)?)\s*(%|R\b|:1\b|x\b|pips?|ticks?|bps)",
                     re.I)
@@ -43,7 +53,7 @@ GAP_HEADING_RE = re.compile(
 def load_cards(proj):
     cards = {}
     for path in (proj / "cards").glob("*.jsonl"):
-        if path.name.startswith("_"):
+        if is_internal(path):
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()

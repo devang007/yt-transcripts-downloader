@@ -16,24 +16,37 @@ Usage:
 
 import argparse
 import json
+import unicodedata
 import re
 import sys
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 
 REQUIRED = ["id", "video_id", "timestamp", "type", "topics", "claim", "anchor", "stated"]
 TYPES = {"rule", "procedure", "rationale", "definition", "example", "number",
          "psychology", "caveat", "opinion", "anecdote", "contradiction"}
-ID_RE = re.compile(r"^EV-\d{4,}$")
+ID_RE = re.compile(r"^EV-(?:[A-Za-z0-9_-]{11}-\d{2,}|\d{4,})$")
+CITE_RE = re.compile(r"EV-(?:[A-Za-z0-9_-]{11}-\d{2,}|\d{4,})")
 MAX_ANCHOR_WORDS = 15
 
 NEGATION = re.compile(r"\b(never|don'?t|not|no longer|avoid|stopped|without)\b", re.I)
+
+def is_internal(path):
+    """True for the phase's own bookkeeping files, false for real card files.
+
+    A YouTube video ID is exactly 11 characters and is allowed to begin with
+    an underscore, so a leading "_" alone cannot be the test — using it silently
+    hides real cards. Length is what actually separates the two.
+    """
+    return path.stem.startswith("_") and len(path.stem) != 11
+
 
 
 def load_cards(proj):
     cards, errors = [], []
     for path in sorted((proj / "cards").glob("*.jsonl")):
-        if path.name.startswith("_"):
+        if is_internal(path):
             continue
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             line = line.strip()
@@ -71,6 +84,146 @@ def canon(topics, tax):
     return sorted({tax.get(t, t) for t in topics})
 
 
+def corpus_body(proj, video_id):
+    """Transcript text with timestamp markers and whitespace normalised away."""
+    f = proj / "corpus/videos" / f"{video_id}.txt"
+    if not f.exists():
+        return None
+    t = f.read_text(encoding="utf-8")
+    t = t.split("---", 1)[1] if "---" in t else t
+    t = re.sub(r"\[\d{2}:\d{2}:\d{2}\]", " ", t)
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", t))
+
+
+def norm_anchor(s):
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(s or ""))).strip()
+
+
+def anchor_status(anchor, text):
+    """exact | fragments | near:<ratio> | missing — how well an anchor locates.
+
+    An anchor is a VERBATIM locator. A model that normalises the creator's words
+    while writing it has quietly turned a quotation into a paraphrase, and no
+    downstream check will notice. This is the one fidelity property that can be
+    tested mechanically, so it should be.
+    """
+    a = norm_anchor(anchor)
+    if not a:
+        return "missing", None
+    if a in text:
+        return "exact", a
+    parts = [p.strip() for p in re.split(r"\.\.\.|\u2026", a) if len(p.strip()) > 8]
+    if parts and all(p in text for p in parts):
+        return "fragments", None
+    best, span = 0.0, None
+    L = len(a)
+    step = max(L // 4, 1)
+    for i in range(0, max(len(text) - L, 1), step):
+        w = text[i:i + int(L * 1.4)]
+        r = SequenceMatcher(None, a, w).ratio()
+        if r > best:
+            best, span = r, w
+    if best >= 0.75:
+        return f"near:{best:.2f}", span
+    return "missing", None
+
+
+def repair_anchor(anchor, text):
+    """Snap a near-miss anchor back onto the real transcript span.
+
+    Near-misses are almost always mechanical: the model joined a line break,
+    normalised a curly quote, or dropped punctuation while copying. The creator's
+    actual words are still there, so the fix is to find the longest genuinely
+    common run and use that rather than discard a good card. Returns None when
+    nothing long enough is recoverable — better an honest failure than a
+    plausible-looking anchor that locates the wrong moment.
+    """
+    a = norm_anchor(anchor)
+    if not a:
+        return None
+    L = len(a)
+    best, span = 0.0, None
+    for i in range(0, max(len(text) - L, 1), max(L // 4, 1)):
+        w = text[i:i + int(L * 1.6)]
+        r = SequenceMatcher(None, a, w).ratio()
+        if r > best:
+            best, span = r, w
+    if span is None or best < 0.7:
+        return None
+    m = SequenceMatcher(None, a, span).find_longest_match(0, len(a), 0, len(span))
+    frag = span[m.b:m.b + m.size].strip()
+    # trim to whole words so the anchor still reads as a phrase
+    if " " in frag:
+        parts = frag.split()
+        if not span.startswith(frag) and len(parts) > 1 and not frag[0].isspace():
+            pass
+        frag = " ".join(parts)
+    if len(frag) < 20 or frag not in text:
+        return None
+    return frag
+
+
+def cmd_anchors(args, proj):
+    cards, _ = load_cards(proj)
+    counts = Counter()
+    problems, repairs = [], []
+    for c in cards:
+        text = corpus_body(proj, c.get("video_id", ""))
+        if text is None:
+            counts["no_transcript"] += 1
+            continue
+        status, span = anchor_status(c.get("anchor"), text)
+        key = status.split(":")[0]
+        counts[key] += 1
+        if key in ("near", "missing"):
+            if args.repair:
+                fixed = repair_anchor(c.get("anchor"), text)
+                if fixed:
+                    repairs.append((c["video_id"], c["id"], fixed))
+                    counts["repaired"] += 1
+                    continue
+            problems.append((c.get("id"), status, norm_anchor(c.get("anchor"))[:70]))
+
+    total = sum(counts[k] for k in ("exact", "fragments", "near", "missing")) or 1
+    print(f"{len(cards)} cards checked against the corpus\n")
+    for k, label in (("exact", "verbatim substring"), ("fragments", "ellipsis, all parts verbatim"),
+                     ("near", "close but altered — the creator's words were normalised"),
+                     ("missing", "not locatable in the transcript"),
+                     ("no_transcript", "video not in corpus")):
+        if counts[k]:
+            print(f"  {counts[k]:>6}  {counts[k]*100//total:>3}%  {label}")
+    if problems:
+        print(f"\n{len(problems)} anchors need attention:")
+        for cid, st, a in problems[:40]:
+            print(f"  [{st}] {cid}  {a}")
+        if len(problems) > 40:
+            print(f"  ... and {len(problems)-40} more")
+    if repairs:
+        by_vid = defaultdict(dict)
+        for vid, cid, fixed in repairs:
+            by_vid[vid][cid] = fixed
+        for vid, fixes in by_vid.items():
+            f = proj / "cards" / f"{vid}.jsonl"
+            if not f.exists():
+                continue
+            out = []
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                c = json.loads(line)
+                if c.get("id") in fixes:
+                    c["anchor"] = fixes[c["id"]]
+                    c["anchor_repaired"] = True
+                out.append(json.dumps(c, ensure_ascii=False))
+            f.write_text("\n".join(out) + "\n", encoding="utf-8")
+        print(f"\nrepaired {len(repairs)} anchors in {len(by_vid)} files "
+              f"(marked anchor_repaired)")
+
+    bad = counts["near"] + counts["missing"]
+    print(f"\nverbatim rate: {(counts['exact']+counts['fragments'])*100//total}%")
+    sys.exit(1 if bad * 100 // total > args.max_bad_pct else 0)
+
+
 def cmd_validate(args, proj):
     cards, errors = load_cards(proj)
     manifest = load_manifest(proj)
@@ -81,7 +234,7 @@ def cmd_validate(args, proj):
             if not c.get(f):
                 errors.append(f"{cid}: missing required field '{f}'")
         if not ID_RE.match(str(cid)):
-            errors.append(f"{cid}: id must look like EV-0001")
+            errors.append(f"{cid}: id must look like EV-<video_id>-01")
         if cid in seen:
             errors.append(f"{cid}: duplicate id (also in {seen[cid]})")
         seen[cid] = c.get("video_id")
@@ -272,7 +425,7 @@ def cmd_coverage(args, proj):
 
     cited = set()
     for ch in sorted((proj / "chapters").glob("*.md")):
-        cited.update(re.findall(r"EV-\d{4,}", ch.read_text(encoding="utf-8")))
+        cited.update(CITE_RE.findall(ch.read_text(encoding="utf-8")))
     card_video = {c["id"]: c["video_id"] for c in cards}
     videos_in_book = {card_video[i] for i in cited if i in card_video}
 
@@ -298,19 +451,26 @@ def cmd_coverage(args, proj):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["validate", "stats", "ledger", "fetch", "coverage"])
+    ap.add_argument("command", choices=["validate", "stats", "ledger", "fetch",
+                                    "coverage", "anchors"])
     ap.add_argument("--project", required=True)
     ap.add_argument("--topics", help="comma-separated topics (fetch)")
     ap.add_argument("--types", help="comma-separated card types (fetch)")
     ap.add_argument("--ids", help="comma-separated card ids (fetch)")
     ap.add_argument("--out", help="output file (fetch)")
+    ap.add_argument("--repair", action="store_true",
+                    help="anchors: rewrite recoverable near-miss anchors to the real "
+                         "transcript span, marking them anchor_repaired")
+    ap.add_argument("--max-bad-pct", type=int, default=5,
+                    help="anchors: fail above this %% of altered/missing anchors")
     args = ap.parse_args()
 
     proj = Path(args.project)
     if not proj.is_dir():
         sys.exit(f"Project directory not found: {proj}")
     {"validate": cmd_validate, "stats": cmd_stats, "ledger": cmd_ledger,
-     "fetch": cmd_fetch, "coverage": cmd_coverage}[args.command](args, proj)
+     "fetch": cmd_fetch, "coverage": cmd_coverage,
+     "anchors": cmd_anchors}[args.command](args, proj)
 
 
 if __name__ == "__main__":

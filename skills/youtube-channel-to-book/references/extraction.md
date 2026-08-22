@@ -8,7 +8,7 @@ One JSON object per line in `cards/<video_id>.jsonl`:
 
 ```json
 {
-  "id": "EV-0142",
+  "id": "EV-dQw4w9WgXcQ-07",
   "video_id": "dQw4w9WgXcQ",
   "video_title": "Why I Stopped Trading the First 15 Minutes",
   "published": "2023-04-11",
@@ -28,7 +28,7 @@ One JSON object per line in `cards/<video_id>.jsonl`:
 
 Field notes:
 
-- **id** — globally unique, sequential across the whole project. Never reuse or renumber after chapters cite them.
+- **id** — `EV-<video_id>-<nn>`, where `<nn>` is a two-digit counter within that video (`EV-dQw4w9WgXcQ-07`). This is unique **by construction**, so parallel extraction agents never need coordinating, never need pre-allocated number blocks, and an interrupted run can be resumed by simply re-running the videos that have no card file. Do not use a project-wide sequential counter: it forces every restart to re-derive a high-water mark, which is pure overhead and the usual source of collisions. Never renumber after chapters cite them.
 - **claim** — one sentence, one idea, in your words. If you need "and" to join two rules, make two cards.
 - **anchor** — a short verbatim fragment, roughly a dozen words at most, purely so a human can locate the moment. It is a locator, not a quotation for reuse. Never store a paragraph here.
 - **conditions** — the scope. Most trading advice is conditional and most summaries destroy the conditions. This field is the difference between a useful book and a dangerous one.
