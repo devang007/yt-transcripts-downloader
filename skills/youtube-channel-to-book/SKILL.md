@@ -194,6 +194,11 @@ limit into a pause; one large burst turns it into lost work.
 
 ## Standing rules
 
+- **Give concurrent agents unique scratch filenames.** Agents sharing a scratch
+  directory and using generic script names (`gen.py`, `script.py`) will silently
+  overwrite each other mid-run. Card *output* survives this because each agent verifies
+  its own anchors before writing, but the collision wastes a full agent run. Tell every
+  extraction agent to name scratch files after its own assigned video id(s).
 - **Separate reading progress from claiming work.** A launcher that hands out work
   must also mark it in-flight, or a second launcher re-hands the same batch while the
   first agent is still working — the completed-file check cannot see an agent that has
