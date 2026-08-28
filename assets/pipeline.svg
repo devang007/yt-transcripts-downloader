@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 220" width="1000" height="220" role="img" aria-label="pipeline: channel to transcripts to cards to ledger to chapters to book">
+  <defs>
+    <style>
+      .mono { font-family: ui-monospace, "SFMono-Regular", "JetBrains Mono", "DejaVu Sans Mono", monospace; }
+      .box  { fill:#0f172a; stroke:#243044; stroke-width:2 }
+      .lbl  { fill:#e2e8f0; font-size:16px; font-weight:600 }
+      .sub  { fill:#64748b; font-size:12.5px }
+      .pkt  { animation: run 6s linear infinite }
+      @keyframes run {
+        0%   { transform: translateX(0);   opacity:0 }
+        4%   { opacity:1 }
+        96%  { opacity:1 }
+        100% { transform: translateX(780px); opacity:0 }
+      }
+      .p2 { animation-delay:-1.5s } .p3 { animation-delay:-3s } .p4 { animation-delay:-4.5s }
+      .glow { animation: g 4s ease-in-out infinite }
+      @keyframes g { 0%,100% { stroke-opacity:.25 } 50% { stroke-opacity:.9 } }
+    </style>
+  </defs>
+  <rect width="1000" height="220" rx="14" fill="#0b0f14" stroke="#1f2937" stroke-width="2"/>
+
+  <line x1="110" y1="96" x2="890" y2="96" stroke="#1e293b" stroke-width="2"/>
+  <g class="pkt"><circle cx="110" cy="96" r="4.5" fill="#38bdf8"/></g>
+  <g class="pkt p2"><circle cx="110" cy="96" r="4.5" fill="#a78bfa"/></g>
+  <g class="pkt p3"><circle cx="110" cy="96" r="4.5" fill="#34d399"/></g>
+  <g class="pkt p4"><circle cx="110" cy="96" r="4.5" fill="#facc15"/></g>
+
+  <g class="mono">
+    <g transform="translate(40,60)">
+      <rect class="box" width="140" height="72" rx="10"/>
+      <rect width="140" height="72" rx="10" fill="none" stroke="#38bdf8" class="glow"/>
+      <text class="lbl" x="70" y="32" text-anchor="middle">channel</text>
+      <text class="sub" x="70" y="52" text-anchor="middle">yt-tx discover</text>
+    </g>
+    <g transform="translate(235,60)">
+      <rect class="box" width="150" height="72" rx="10"/>
+      <text class="lbl" x="75" y="32" text-anchor="middle">transcripts</text>
+      <text class="sub" x="75" y="52" text-anchor="middle">yt-tx run · export</text>
+    </g>
+    <g transform="translate(440,60)">
+      <rect class="box" width="150" height="72" rx="10"/>
+      <text class="lbl" x="75" y="32" text-anchor="middle">evidence cards</text>
+      <text class="sub" x="75" y="52" text-anchor="middle">one claim · one stamp</text>
+    </g>
+    <g transform="translate(645,60)">
+      <rect class="box" width="140" height="72" rx="10"/>
+      <text class="lbl" x="70" y="32" text-anchor="middle">chapters</text>
+      <text class="sub" x="70" y="52" text-anchor="middle">drafted from cards</text>
+    </g>
+    <g transform="translate(840,60)">
+      <rect class="box" width="120" height="72" rx="10"/>
+      <rect width="120" height="72" rx="10" fill="none" stroke="#34d399" class="glow" style="animation-delay:-2s"/>
+      <text class="lbl" x="60" y="32" text-anchor="middle">book</text>
+      <text class="sub" x="60" y="52" text-anchor="middle">html · pdf</text>
+    </g>
+    <text class="sub" x="500" y="182" text-anchor="middle" fill="#94a3b8">
+      every phase writes to disk — kill it anywhere, re-run, it picks up where it stopped
+    </text>
+  </g>
+</svg>
